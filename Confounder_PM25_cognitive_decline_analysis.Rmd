@@ -1,0 +1,758 @@
+---
+title: "PM2.5 levels and Subjective cognitive decline"
+author: "Aakash Parekh and Dr. Erik Parker"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 1
+    code_folding: hide
+    df_print: kable
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style>
+pre {
+  overflow-x: auto;
+}
+pre code {
+  word-wrap: normal;
+  white-space: pre;
+}
+</style>
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(zoo)
+library(mice)
+library(lmerTest)
+library(gtsummary)
+library(sjPlot)
+library(patchwork)
+
+# ── Read in cognitive decline data ────────────────────────────────────────────
+Total_Cog_Decline <- read.csv("~/Desktop/CH internship/New versions BRFSS data/cognitive_decline_by_state_2015_to_2023.csv")
+# Pivot from wide to long
+Total_Cog_Decline_long <- Total_Cog_Decline %>%
+  pivot_longer(
+    cols = starts_with("X"),
+    names_to = "Year",
+    names_prefix = "X",
+    values_to = "MeanCognitiveDecline"
+  ) %>%
+  mutate(Year = as.integer(Year))
+
+# Count non-NA data points per state
+state_data_counts <- Total_Cog_Decline_long %>%
+  group_by(StateName) %>%
+  summarise(years_with_data = sum(!is.na(MeanCognitiveDecline)))
+
+# Filter out states with 2 or fewer years of data
+states_with_enough_data <- state_data_counts %>%
+  filter(years_with_data > 2) %>%
+  pull(StateName)
+
+Total_Cog_Decline_long_filtered <- Total_Cog_Decline_long %>%
+  filter(StateName %in% states_with_enough_data)
+
+# Linear interpolation between yearly points
+Total_Cog_Decline_long_interp <- Total_Cog_Decline_long %>%
+  group_by(StateName) %>%
+  arrange(Year) %>%
+  mutate(InterpolatedLine = na.approx(MeanCognitiveDecline, Year, na.rm = FALSE)) %>%
+  ungroup()
+
+# ── Read in PM2.5 data ────────────────────────────────────────────────────────
+pm25_all_states_years <- read_csv("~/Desktop/CH internship/New versions BRFSS data/pm25_all_states_years.csv") %>%
+  select(-State.Code)
+
+# Calculate lags for PM2.5
+pm25_all_states_years <- pm25_all_states_years %>%
+  arrange(StateName, Year) %>%
+  group_by(StateName) %>%
+  mutate(
+    PM25_lag1 = lag(Mean_PM25, n = 1),
+    PM25_lag2 = lag(Mean_PM25, n = 2),
+    PM25_lag3 = lag(Mean_PM25, n = 3)
+  ) %>%
+  ungroup()
+
+# ── Read in confounder data ───────────────────────────────────────────────────
+state_confounders <- read_csv("~/Desktop/CH internship/New versions BRFSS data/state_confounders_2015_2023.csv")
+
+# ── Merge all data ────────────────────────────────────────────────────────────
+
+# Merge PM2.5 and confounders with full interpolated cognitive decline data
+merged_long_data <- Total_Cog_Decline_long_interp %>%
+  left_join(pm25_all_states_years, by = c("StateName", "Year")) %>%
+  left_join(state_confounders, by = c("StateName", "Year"))
+
+# Merge PM2.5 and confounders with filtered cognitive decline data (3+ obs states only)
+filtered_merged_long_data <- Total_Cog_Decline_long_filtered %>%
+  left_join(pm25_all_states_years, by = c("StateName", "Year")) %>%
+  left_join(state_confounders, by = c("StateName", "Year"))
+
+# ── Multiple imputation ───────────────────────────────────────────────────────
+
+# Pivot to wide format for imputation
+wide_merged_data <- merged_long_data %>%
+  select(-InterpolatedLine) %>%
+  pivot_wider(
+    values_from = c("MeanCognitiveDecline", "Mean_PM25", "PM25_lag1", "PM25_lag2", "PM25_lag3",
+                    "pct_age65plus", "pct_depression", "pct_smoker", "pct_stroke",
+                    "pct_lowedu", "pct_lowincome", "pct_nonwhite"),
+    names_from = "Year"
+  )
+
+# Run mice imputation
+imputed_data <- mice(wide_merged_data,
+                     m = 10,
+                     maxit = 10,
+                     method = "pmm",
+                     seed = 8675309,
+                     verbose = FALSE)
+
+# Extract long format from imputed data (exclude = FALSE keeps original unimputed dataset)
+imputed_complete <- complete(imputed_data, action = "long", include = FALSE)
+
+# Pivot each variable back to long format
+cog_long <- imputed_complete %>%
+  pivot_longer(cols = starts_with("MeanCognitiveDecline_"),
+               names_to = "Year", names_prefix = "MeanCognitiveDecline_",
+               values_to = "MeanCognitiveDecline")
+
+pm25_long <- imputed_complete %>%
+  pivot_longer(cols = starts_with("Mean_PM25_"),
+               names_to = "Year", names_prefix = "Mean_PM25_",
+               values_to = "Mean_PM25")
+
+pm25_lag1_long <- imputed_complete %>%
+  pivot_longer(cols = starts_with("PM25_lag1_"),
+               names_to = "Year", names_prefix = "PM25_lag1_",
+               values_to = "PM25_lag1")
+
+pm25_lag2_long <- imputed_complete %>%
+  pivot_longer(cols = starts_with("PM25_lag2_"),
+               names_to = "Year", names_prefix = "PM25_lag2_",
+               values_to = "PM25_lag2")
+
+pm25_lag3_long <- imputed_complete %>%
+  pivot_longer(cols = starts_with("PM25_lag3_"),
+               names_to = "Year", names_prefix = "PM25_lag3_",
+               values_to = "PM25_lag3")
+
+conf_age_long <- imputed_complete %>%
+  pivot_longer(cols = starts_with("pct_age65plus_"),
+               names_to = "Year", names_prefix = "pct_age65plus_",
+               values_to = "pct_age65plus")
+
+conf_dep_long <- imputed_complete %>%
+  pivot_longer(cols = starts_with("pct_depression_"),
+               names_to = "Year", names_prefix = "pct_depression_",
+               values_to = "pct_depression")
+
+conf_smok_long <- imputed_complete %>%
+  pivot_longer(cols = starts_with("pct_smoker_"),
+               names_to = "Year", names_prefix = "pct_smoker_",
+               values_to = "pct_smoker")
+
+conf_stroke_long <- imputed_complete %>%
+  pivot_longer(cols = starts_with("pct_stroke_"),
+               names_to = "Year", names_prefix = "pct_stroke_",
+               values_to = "pct_stroke")
+
+conf_edu_long <- imputed_complete %>%
+  pivot_longer(cols = starts_with("pct_lowedu_"),
+               names_to = "Year", names_prefix = "pct_lowedu_",
+               values_to = "pct_lowedu")
+
+conf_inc_long <- imputed_complete %>%
+  pivot_longer(cols = starts_with("pct_lowincome_"),
+               names_to = "Year", names_prefix = "pct_lowincome_",
+               values_to = "pct_lowincome")
+
+conf_race_long <- imputed_complete %>%
+  pivot_longer(cols = starts_with("pct_nonwhite_"),
+               names_to = "Year", names_prefix = "pct_nonwhite_",
+               values_to = "pct_nonwhite")
+
+# Join all long datasets together
+imputed_long <- cog_long %>%
+  left_join(pm25_long,       by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(pm25_lag1_long,  by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(pm25_lag2_long,  by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(pm25_lag3_long,  by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(conf_age_long,   by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(conf_dep_long,   by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(conf_smok_long,  by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(conf_stroke_long,by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(conf_edu_long,   by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(conf_inc_long,   by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(conf_race_long,  by = c("StateName", "Year", ".imp", ".id")) %>%
+  select(.imp, .id, StateName, Year, MeanCognitiveDecline, Mean_PM25,
+         PM25_lag1, PM25_lag2, PM25_lag3,
+         pct_age65plus, pct_depression, pct_smoker, pct_stroke,
+         pct_lowedu, pct_lowincome, pct_nonwhite)
+
+```
+
+
+# Descriptive Statistics {.tabset}
+
+## Average cognitive decline by state (raw data)
+
+```{r}
+
+Total_Cog_Decline_long %>%
+  group_by(StateName) %>%
+  summarise(Average_Decline = mean(MeanCognitiveDecline, na.rm = TRUE)) %>%
+  arrange(desc(Average_Decline)) %>%
+  print(n = 52)
+
+```
+
+## Average cognitive decline by state (imputed data)
+
+```{r}
+
+imputed_long %>%
+  group_by(StateName) %>%
+  summarise(Average_Decline = mean(MeanCognitiveDecline, na.rm = TRUE)) %>%
+  arrange(desc(Average_Decline)) %>%
+  print(n = 52)
+
+```
+
+## Average PM2.5 by state
+
+```{r}
+
+pm25_all_states_years %>%
+  group_by(StateName) %>%
+  summarise(Average_PM2.5 = mean(Mean_PM25, na.rm = TRUE)) %>%
+  arrange(desc(Average_PM2.5)) %>%
+  print(n = 60)
+
+```
+
+## Confounder summary table
+
+```{r}
+
+state_confounders %>%
+  select(-StateName, -Year) %>%
+  select(pct_age65plus, pct_depression, pct_smoker, 
+         pct_stroke, pct_lowedu, pct_lowincome, pct_nonwhite) %>%
+  tbl_summary(
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    label = list(
+      pct_age65plus  ~ "% Age 65+",
+      pct_depression ~ "% With depression",
+      pct_smoker     ~ "% Current/former smoker",
+      pct_stroke     ~ "% With stroke history",
+      pct_lowedu     ~ "% Less than high school education",
+      pct_lowincome  ~ "% Low income",
+      pct_nonwhite   ~ "% Non-white"
+    ),
+    digits = all_continuous() ~ 1
+  ) %>%
+  bold_labels()
+
+```
+
+
+# Linear Mixed Models {.tabset}
+
+Models use state as a random intercept to account for repeated measures. The outcome (mean cognitive decline) is multiplied by 100 so all beta estimates are on the percentage point scale. Each section presents unadjusted models (Year + PM2.5 lag only) alongside adjusted models (adding all confounders).
+
+Confounders included: % age 65+, % with depression, % smokers, % with stroke history, % low education, % low income, % non-white.
+
+## Full raw dataset {.tabset}
+
+### Unadjusted models
+
+```{r}
+
+mod1_unadj <- merged_long_data %>%
+  rename(PM25_lag = PM25_lag1) %>%
+  lmer(MeanCognitiveDecline*100 ~ Year + PM25_lag + (1 | StateName), data = .)
+
+mod2_unadj <- merged_long_data %>%
+  rename(PM25_lag = PM25_lag2) %>%
+  lmer(MeanCognitiveDecline*100 ~ Year + PM25_lag + (1 | StateName), data = .)
+
+mod3_unadj <- merged_long_data %>%
+  rename(PM25_lag = PM25_lag3) %>%
+  lmer(MeanCognitiveDecline*100 ~ Year + PM25_lag + (1 | StateName), data = .)
+
+tbl1 <- mod1_unadj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy) %>%
+  add_global_p(anova_fun = function(x, ...) { anova(x, ...) |> broom::tidy() }) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl2 <- mod2_unadj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy) %>%
+  add_global_p(anova_fun = function(x, ...) { anova(x, ...) |> broom::tidy() }) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl3 <- mod3_unadj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy) %>%
+  add_global_p(anova_fun = function(x, ...) { anova(x, ...) |> broom::tidy() }) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl_merge(
+  tbls = list(tbl1, tbl2, tbl3),
+  tab_spanner = c("1-year lag", "2-year lag", "3-year lag")
+)
+
+# Save merged table as an object
+table_full_unadj <- tbl_merge(
+  tbls = list(tbl1, tbl2, tbl3),
+  tab_spanner = c("1-year lag", "2-year lag", "3-year lag")
+)
+
+# Display it
+table_full_unadj
+
+# Export to Excel
+library(openxlsx)
+table_full_unadj %>%
+  as_tibble() %>%
+  write.xlsx("~/Desktop/Epi internship/Excel tables/table_full_unadjusted.xlsx")
+```
+
+### Adjusted models
+
+```{r}
+
+mod1_adj <- merged_long_data %>%
+  rename(PM25_lag = PM25_lag1) %>%
+  lmer(MeanCognitiveDecline*100 ~ Year + PM25_lag
+       + pct_age65plus + pct_depression + pct_smoker + pct_stroke
+       + pct_lowedu + pct_lowincome + pct_nonwhite
+       + (1 | StateName), data = .)
+
+mod2_adj <- merged_long_data %>%
+  rename(PM25_lag = PM25_lag2) %>%
+  lmer(MeanCognitiveDecline*100 ~ Year + PM25_lag
+       + pct_age65plus + pct_depression + pct_smoker + pct_stroke
+       + pct_lowedu + pct_lowincome + pct_nonwhite
+       + (1 | StateName), data = .)
+
+mod3_adj <- merged_long_data %>%
+  rename(PM25_lag = PM25_lag3) %>%
+  lmer(MeanCognitiveDecline*100 ~ Year + PM25_lag
+       + pct_age65plus + pct_depression + pct_smoker + pct_stroke
+       + pct_lowedu + pct_lowincome + pct_nonwhite
+       + (1 | StateName), data = .)
+
+tbl1 <- mod1_adj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy) %>%
+  add_global_p(anova_fun = function(x, ...) { anova(x, ...) |> broom::tidy() }) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl2 <- mod2_adj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy) %>%
+  add_global_p(anova_fun = function(x, ...) { anova(x, ...) |> broom::tidy() }) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl3 <- mod3_adj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy) %>%
+  add_global_p(anova_fun = function(x, ...) { anova(x, ...) |> broom::tidy() }) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl_merge(
+  tbls = list(tbl1, tbl2, tbl3),
+  tab_spanner = c("1-year lag", "2-year lag", "3-year lag")
+)
+
+# Save merged table as an object
+table_full_adj <- tbl_merge(
+  tbls = list(tbl1, tbl2, tbl3),
+  tab_spanner = c("1-year lag", "2-year lag", "3-year lag")
+)
+
+# Display it
+table_full_adj
+
+# Export to Excel
+library(openxlsx)
+table_full_adj %>%
+  as_tibble() %>%
+  write.xlsx("~/Desktop/Epi internship/Excel tables/table_full_adjusted.xlsx")
+
+```
+
+### Unadjusted vs Adjusted comparison (1-year lag)
+
+```{r}
+
+tbl_unadj <- mod1_unadj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy,
+                 include = "PM25_lag") %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl_adj <- mod1_adj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy,
+                 include = "PM25_lag") %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl_merge(
+  tbls = list(tbl_unadj, tbl_adj),
+  tab_spanner = c("Unadjusted", "Adjusted")
+)
+
+```
+
+
+## Filtered raw dataset {.tabset}
+
+### Unadjusted models
+
+```{r}
+
+mod1_unadj <- filtered_merged_long_data %>%
+  rename(PM25_lag = PM25_lag1) %>%
+  lmer(MeanCognitiveDecline*100 ~ Year + PM25_lag + (1 | StateName), data = .)
+
+mod2_unadj <- filtered_merged_long_data %>%
+  rename(PM25_lag = PM25_lag2) %>%
+  lmer(MeanCognitiveDecline*100 ~ Year + PM25_lag + (1 | StateName), data = .)
+
+mod3_unadj <- filtered_merged_long_data %>%
+  rename(PM25_lag = PM25_lag3) %>%
+  lmer(MeanCognitiveDecline*100 ~ Year + PM25_lag + (1 | StateName), data = .)
+
+tbl1 <- mod1_unadj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy) %>%
+  add_global_p(anova_fun = function(x, ...) { anova(x, ...) |> broom::tidy() }) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl2 <- mod2_unadj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy) %>%
+  add_global_p(anova_fun = function(x, ...) { anova(x, ...) |> broom::tidy() }) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl3 <- mod3_unadj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy) %>%
+  add_global_p(anova_fun = function(x, ...) { anova(x, ...) |> broom::tidy() }) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl_merge(
+  tbls = list(tbl1, tbl2, tbl3),
+  tab_spanner = c("1-year lag", "2-year lag", "3-year lag")
+)
+
+# Save merged table as an object
+table_filt_unadj <- tbl_merge(
+  tbls = list(tbl1, tbl2, tbl3),
+  tab_spanner = c("1-year lag", "2-year lag", "3-year lag")
+)
+
+# Display it
+table_filt_unadj
+
+# Export to Excel
+library(openxlsx)
+table_filt_unadj %>%
+  as_tibble() %>%
+  write.xlsx("~/Desktop/Epi internship/Excel tables/table_filt_unadjusted.xlsx")
+
+```
+
+### Adjusted models
+
+```{r}
+
+mod1_adj <- filtered_merged_long_data %>%
+  rename(PM25_lag = PM25_lag1) %>%
+  lmer(MeanCognitiveDecline*100 ~ Year + PM25_lag
+       + pct_age65plus + pct_depression + pct_smoker + pct_stroke
+       + pct_lowedu + pct_lowincome + pct_nonwhite
+       + (1 | StateName), data = .)
+
+mod2_adj <- filtered_merged_long_data %>%
+  rename(PM25_lag = PM25_lag2) %>%
+  lmer(MeanCognitiveDecline*100 ~ Year + PM25_lag
+       + pct_age65plus + pct_depression + pct_smoker + pct_stroke
+       + pct_lowedu + pct_lowincome + pct_nonwhite
+       + (1 | StateName), data = .)
+
+mod3_adj <- filtered_merged_long_data %>%
+  rename(PM25_lag = PM25_lag3) %>%
+  lmer(MeanCognitiveDecline*100 ~ Year + PM25_lag
+       + pct_age65plus + pct_depression + pct_smoker + pct_stroke
+       + pct_lowedu + pct_lowincome + pct_nonwhite
+       + (1 | StateName), data = .)
+
+tbl1 <- mod1_adj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy) %>%
+  add_global_p(anova_fun = function(x, ...) { anova(x, ...) |> broom::tidy() }) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl2 <- mod2_adj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy) %>%
+  add_global_p(anova_fun = function(x, ...) { anova(x, ...) |> broom::tidy() }) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl3 <- mod3_adj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy) %>%
+  add_global_p(anova_fun = function(x, ...) { anova(x, ...) |> broom::tidy() }) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl_merge(
+  tbls = list(tbl1, tbl2, tbl3),
+  tab_spanner = c("1-year lag", "2-year lag", "3-year lag")
+)
+
+# Save merged table as an object
+table_filt_adj <- tbl_merge(
+  tbls = list(tbl1, tbl2, tbl3),
+  tab_spanner = c("1-year lag", "2-year lag", "3-year lag")
+)
+
+# Display it
+table_filt_adj
+
+# Export to Excel
+library(openxlsx)
+table_filt_adj %>%
+  as_tibble() %>%
+  write.xlsx("~/Desktop/Epi internship/Excel tables/table_filt_adjusted.xlsx")
+
+```
+
+### Unadjusted vs Adjusted comparison (1-year lag)
+
+```{r}
+
+tbl_unadj <- mod1_unadj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy,
+                 include = "PM25_lag") %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl_adj <- mod1_adj %>%
+  tbl_regression(pvalue_fun = ~ style_pvalue(.x, digits = 3),
+                 tidy_fun = broom.mixed::tidy,
+                 include = "PM25_lag") %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl_merge(
+  tbls = list(tbl_unadj, tbl_adj),
+  tab_spanner = c("Unadjusted", "Adjusted")
+)
+
+```
+
+
+## Imputed dataset {.tabset}
+
+Models fit on all 10 imputed datasets and pooled using Rubin's rules to account for imputation uncertainty.
+
+### Unadjusted models
+
+```{r}
+
+# Rebuild mids object with original dataset included
+imputed_complete_orig <- complete(imputed_data, action = "long", include = TRUE)
+
+cog_long <- imputed_complete_orig %>%
+  pivot_longer(cols = starts_with("MeanCognitiveDecline_"),
+               names_to = "Year", names_prefix = "MeanCognitiveDecline_",
+               values_to = "MeanCognitiveDecline")
+
+pm25_long <- imputed_complete_orig %>%
+  pivot_longer(cols = starts_with("Mean_PM25_"),
+               names_to = "Year", names_prefix = "Mean_PM25_",
+               values_to = "Mean_PM25")
+
+pm25_lag1_long <- imputed_complete_orig %>%
+  pivot_longer(cols = starts_with("PM25_lag1_"),
+               names_to = "Year", names_prefix = "PM25_lag1_",
+               values_to = "PM25_lag1")
+
+pm25_lag2_long <- imputed_complete_orig %>%
+  pivot_longer(cols = starts_with("PM25_lag2_"),
+               names_to = "Year", names_prefix = "PM25_lag2_",
+               values_to = "PM25_lag2")
+
+pm25_lag3_long <- imputed_complete_orig %>%
+  pivot_longer(cols = starts_with("PM25_lag3_"),
+               names_to = "Year", names_prefix = "PM25_lag3_",
+               values_to = "PM25_lag3")
+
+conf_age_long <- imputed_complete_orig %>%
+  pivot_longer(cols = starts_with("pct_age65plus_"),
+               names_to = "Year", names_prefix = "pct_age65plus_",
+               values_to = "pct_age65plus")
+
+conf_dep_long <- imputed_complete_orig %>%
+  pivot_longer(cols = starts_with("pct_depression_"),
+               names_to = "Year", names_prefix = "pct_depression_",
+               values_to = "pct_depression")
+
+conf_smok_long <- imputed_complete_orig %>%
+  pivot_longer(cols = starts_with("pct_smoker_"),
+               names_to = "Year", names_prefix = "pct_smoker_",
+               values_to = "pct_smoker")
+
+conf_stroke_long <- imputed_complete_orig %>%
+  pivot_longer(cols = starts_with("pct_stroke_"),
+               names_to = "Year", names_prefix = "pct_stroke_",
+               values_to = "pct_stroke")
+
+conf_edu_long <- imputed_complete_orig %>%
+  pivot_longer(cols = starts_with("pct_lowedu_"),
+               names_to = "Year", names_prefix = "pct_lowedu_",
+               values_to = "pct_lowedu")
+
+conf_inc_long <- imputed_complete_orig %>%
+  pivot_longer(cols = starts_with("pct_lowincome_"),
+               names_to = "Year", names_prefix = "pct_lowincome_",
+               values_to = "pct_lowincome")
+
+conf_race_long <- imputed_complete_orig %>%
+  pivot_longer(cols = starts_with("pct_nonwhite_"),
+               names_to = "Year", names_prefix = "pct_nonwhite_",
+               values_to = "pct_nonwhite")
+
+imputed_long_orig <- cog_long %>%
+  left_join(pm25_long,        by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(pm25_lag1_long,   by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(pm25_lag2_long,   by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(pm25_lag3_long,   by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(conf_age_long,    by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(conf_dep_long,    by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(conf_smok_long,   by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(conf_stroke_long, by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(conf_edu_long,    by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(conf_inc_long,    by = c("StateName", "Year", ".imp", ".id")) %>%
+  left_join(conf_race_long,   by = c("StateName", "Year", ".imp", ".id")) %>%
+  select(.imp, .id, StateName, Year, MeanCognitiveDecline, Mean_PM25,
+         PM25_lag1, PM25_lag2, PM25_lag3,
+         pct_age65plus, pct_depression, pct_smoker, pct_stroke,
+         pct_lowedu, pct_lowincome, pct_nonwhite) %>%
+  mutate(.id = row_number())
+
+imputed_long_mids <- as.mids(imputed_long_orig)
+
+# Fit unadjusted models
+mod1_unadj <- with(imputed_long_mids,
+                   lmer(MeanCognitiveDecline*100 ~ as.numeric(Year) + PM25_lag1 + (1 | StateName)))
+
+mod2_unadj <- with(imputed_long_mids,
+                   lmer(MeanCognitiveDecline*100 ~ as.numeric(Year) + PM25_lag2 + (1 | StateName)))
+
+mod3_unadj <- with(imputed_long_mids,
+                   lmer(MeanCognitiveDecline*100 ~ as.numeric(Year) + PM25_lag3 + (1 | StateName)))
+
+tbl1 <- tbl_regression(mod1_unadj) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl2 <- tbl_regression(mod2_unadj) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl3 <- tbl_regression(mod3_unadj) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl_merge(
+  tbls = list(tbl1, tbl2, tbl3),
+  tab_spanner = c("1-year lag", "2-year lag", "3-year lag")
+)
+
+```
+
+### Adjusted models
+
+```{r}
+
+mod1_adj <- with(imputed_long_mids,
+                 lmer(MeanCognitiveDecline*100 ~ as.numeric(Year) + PM25_lag1
+                      + pct_age65plus + pct_depression + pct_smoker + pct_stroke
+                      + pct_lowedu + pct_lowincome + pct_nonwhite
+                      + (1 | StateName)))
+
+mod2_adj <- with(imputed_long_mids,
+                 lmer(MeanCognitiveDecline*100 ~ as.numeric(Year) + PM25_lag2
+                      + pct_age65plus + pct_depression + pct_smoker + pct_stroke
+                      + pct_lowedu + pct_lowincome + pct_nonwhite
+                      + (1 | StateName)))
+
+mod3_adj <- with(imputed_long_mids,
+                 lmer(MeanCognitiveDecline*100 ~ as.numeric(Year) + PM25_lag3
+                      + pct_age65plus + pct_depression + pct_smoker + pct_stroke
+                      + pct_lowedu + pct_lowincome + pct_nonwhite
+                      + (1 | StateName)))
+
+tbl1 <- tbl_regression(mod1_adj) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl2 <- tbl_regression(mod2_adj) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl3 <- tbl_regression(mod3_adj) %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl_merge(
+  tbls = list(tbl1, tbl2, tbl3),
+  tab_spanner = c("1-year lag", "2-year lag", "3-year lag")
+)
+
+
+# Save merged table as an object
+table_imputed_adj <- tbl_merge(
+  tbls = list(tbl1, tbl2, tbl3),
+  tab_spanner = c("1-year lag", "2-year lag", "3-year lag")
+)
+
+# Display it
+table_imputed_adj
+
+# Export to Excel
+library(openxlsx)
+table_imputed_adj %>%
+  as_tibble() %>%
+  write.xlsx("~/Desktop/Epi internship/Excel tables/table_imputed_adjusted.xlsx")
+
+```
+
+### Unadjusted vs Adjusted comparison (1-year lag)
+
+```{r}
+
+tbl_unadj <- tbl_regression(mod1_unadj,
+                             include = "PM25_lag1") %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl_adj <- tbl_regression(mod1_adj,
+                           include = "PM25_lag1") %>%
+  bold_p(t = 0.1) %>% bold_labels() %>% italicize_levels()
+
+tbl_merge(
+  tbls = list(tbl_unadj, tbl_adj),
+  tab_spanner = c("Unadjusted", "Adjusted")
+)
+
+```
